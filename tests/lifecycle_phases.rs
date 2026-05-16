@@ -4,6 +4,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc as std_mpsc,
     },
     time::Duration,
 };
@@ -14,7 +15,7 @@ use kameo::{
         Spawn, WeakActorRef,
     },
     error::{ActorStopReason, Infallible},
-    mailbox,
+    mailbox::{self, Signal},
     message::{Context, Message},
     supervision::{RestartPolicy, SupervisionStrategy},
 };
@@ -737,6 +738,85 @@ async fn pending_bounded_user_send_cannot_cross_closed_admission() {
     );
 }
 
+#[test]
+fn blocking_recv_wakes_for_late_control_signal() {
+    let (sender, mut receiver) = mailbox::bounded::<QueueBlockedActor>(1);
+    let (received_sender, received_receiver) = std_mpsc::channel();
+
+    std::thread::spawn(move || {
+        let _ = received_sender.send(receiver.blocking_recv());
+    });
+
+    std::thread::sleep(Duration::from_millis(50));
+    sender
+        .blocking_send(Signal::Stop)
+        .expect("control signal send succeeds while receiver is alive");
+
+    let received_signal = received_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("blocking receive wakes for late control signal");
+    assert!(
+        matches!(received_signal, Some(Signal::Stop)),
+        "blocking receive must observe control signals, not only ordinary messages"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_ask_dropped_by_stop_reports_actor_stopped() {
+    let (handler_started_sender, handler_started_receiver) = oneshot::channel();
+    let (handler_release_sender, handler_release_receiver) = oneshot::channel();
+    let user_work_count = Arc::new(AtomicUsize::new(0));
+    let actor_reference = QueueBlockedActor::spawn_with_mailbox(
+        QueueBlockedActor::new(
+            handler_started_sender,
+            handler_release_receiver,
+            user_work_count.clone(),
+        ),
+        mailbox::bounded(1),
+    );
+
+    actor_reference.wait_for_startup().await;
+    actor_reference
+        .tell(BlockUserHandler)
+        .send()
+        .await
+        .expect("actor accepts handler blocker");
+    handler_started_receiver
+        .await
+        .expect("handler start witness sender remains alive");
+
+    let pending_reply = actor_reference
+        .ask(UserWork)
+        .enqueue()
+        .await
+        .expect("queued ask enters ordinary message lane");
+
+    actor_reference
+        .stop_gracefully()
+        .await
+        .expect("actor accepts graceful stop through the control lane");
+    handler_release_sender
+        .send(())
+        .expect("handler release receiver remains alive");
+
+    let outcome = actor_reference.wait_for_shutdown().await;
+    assert_eq!(outcome.state, ActorStateAbsence::Dropped);
+    assert_eq!(outcome.reason, ActorTerminalReason::Stopped);
+
+    let pending_result = tokio::time::timeout(Duration::from_secs(1), pending_reply)
+        .await
+        .expect("pending reply resolves when queued ask is discarded");
+    assert!(
+        matches!(pending_result, Err(kameo::error::SendError::ActorStopped)),
+        "queued ask discarded by stop reports ActorStopped to the caller"
+    );
+    assert_eq!(
+        user_work_count.load(Ordering::SeqCst),
+        0,
+        "queued ask message is not processed after stop control wins"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn startup_failure_returns_never_allocated_outcome() {
     let actor_reference = StartupFailureActor::spawn(());
@@ -807,6 +887,54 @@ async fn supervisor_restart_waits_for_terminal_outcome_before_replacement_start(
     assert!(
         second_start_saw_previous_drop,
         "supervisor must not restart a replacement before old child state drops"
+    );
+    assert_eq!(witness.drop_count.load(Ordering::SeqCst), 1);
+
+    supervisor
+        .stop_gracefully()
+        .await
+        .expect("supervisor accepts graceful stop");
+    supervisor.wait_for_shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervised_spawn_in_thread_releases_resource_before_restart() {
+    let address_probe =
+        TcpListener::bind(("127.0.0.1", 0)).expect("test fixture reserves an address");
+    let address = address_probe
+        .local_addr()
+        .expect("address probe has a local address");
+    drop(address_probe);
+
+    let (second_start_sender, second_start_receiver) = oneshot::channel();
+    let witness = Arc::new(RestartResourceWitness::new(second_start_sender));
+    let supervisor = RestartSupervisor::spawn(RestartSupervisor);
+    let child = RestartResourceActor::supervise(
+        &supervisor,
+        RestartResourceArguments {
+            address,
+            witness: witness.clone(),
+        },
+    )
+    .restart_policy(RestartPolicy::Permanent)
+    .spawn_in_thread()
+    .await;
+
+    child.wait_for_startup().await;
+    child
+        .tell(StopActor)
+        .send()
+        .await
+        .expect("thread-spawned child accepts stop request");
+
+    let second_start_saw_previous_drop =
+        tokio::time::timeout(Duration::from_secs(2), second_start_receiver)
+            .await
+            .expect("supervisor restarts the thread-spawned child")
+            .expect("second start witness sender remains alive");
+    assert!(
+        second_start_saw_previous_drop,
+        "supervised spawn_in_thread replacement must wait until old child state drops"
     );
     assert_eq!(witness.drop_count.load(Ordering::SeqCst), 1);
 

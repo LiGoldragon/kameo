@@ -441,7 +441,11 @@ impl<A: Actor> MailboxSender<A> {
         res
     }
 
-    /// Completes when the receiver has dropped.
+    /// Completes when the ordinary message lane receiver has dropped.
+    ///
+    /// Lifecycle/control signals use a separate control lane. This method reports the
+    /// user-message lane because public mailbox senders are primarily an ordinary message
+    /// surface.
     ///
     /// See tokio's [`mpsc::Sender::closed`] and [`mpsc::UnboundedSender::closed`] docs for more info.
     ///
@@ -454,9 +458,13 @@ impl<A: Actor> MailboxSender<A> {
         }
     }
 
-    /// Checks if the channel has been closed. This happens when the
+    /// Checks if the ordinary message lane has been closed. This happens when the
     /// [`MailboxReceiver`] is dropped, or when the [`MailboxReceiver::close`] method is
     /// called.
+    ///
+    /// Lifecycle/control signals use a separate control lane. This method reports the
+    /// user-message lane because public mailbox senders are primarily an ordinary message
+    /// surface.
     ///
     /// See tokio's [`mpsc::Sender::is_closed`] and [`mpsc::UnboundedSender::is_closed`] docs for more info.
     ///
@@ -490,8 +498,11 @@ impl<A: Actor> MailboxSender<A> {
         }
     }
 
-    /// Returns the current capacity of the channel, if bounded.
-    /// Unbounded channels return `None`.
+    /// Returns the current capacity of the ordinary message lane, if bounded.
+    /// Unbounded ordinary message lanes return `None`.
+    ///
+    /// Lifecycle/control signals use a separate unbounded control lane, so this value does
+    /// not describe control-signal capacity.
     ///
     /// See tokio's [`mpsc::Sender::capacity`] docs for more info.
     ///
@@ -545,7 +556,11 @@ impl<A: Actor> MailboxSender<A> {
         }
     }
 
-    /// Returns the number of [`MailboxSender`] handles.
+    /// Returns the number of strong handles to the ordinary message lane.
+    ///
+    /// Lifecycle/control signals use a separate control lane. This method reports the
+    /// user-message lane because public mailbox senders are primarily an ordinary message
+    /// surface.
     ///
     /// See tokio's [`mpsc::Sender::strong_count`] and [`mpsc::UnboundedSender::strong_count`] docs for more info.
     ///
@@ -558,7 +573,11 @@ impl<A: Actor> MailboxSender<A> {
         }
     }
 
-    /// Returns the number of [`WeakMailboxSender`] handles.
+    /// Returns the number of weak handles to the ordinary message lane.
+    ///
+    /// Lifecycle/control signals use a separate control lane. This method reports the
+    /// user-message lane because public mailbox senders are primarily an ordinary message
+    /// surface.
     ///
     /// See tokio's [`mpsc::Sender::weak_count`] and [`mpsc::UnboundedSender::weak_count`] docs for more info.
     ///
@@ -954,42 +973,19 @@ impl<A: Actor> MailboxReceiver<A> {
 
     /// Blocking receive to call outside of asynchronous contexts.
     ///
+    /// This mirrors [`Self::recv`]: lifecycle/control signals are observed on the control
+    /// lane and ordinary messages are observed on the message lane. Like Tokio's blocking
+    /// channel receive methods, this must not be called from inside an asynchronous runtime.
+    ///
     /// See tokio's [`mpsc::Receiver::blocking_recv`] and [`mpsc::UnboundedReceiver::blocking_recv`] docs for more info.
     ///
     /// [`mpsc::Receiver::blocking_recv`]: tokio::sync::mpsc::Receiver::blocking_recv
     /// [`mpsc::UnboundedReceiver::blocking_recv`]: tokio::sync::mpsc::UnboundedReceiver::blocking_recv
     pub fn blocking_recv(&mut self) -> Option<Signal<A>> {
-        let message_generation = self.message_generation.clone();
-        let signal = loop {
-            let signal = match &mut self.inner {
-                MailboxReceiverInner::Bounded { messages, control } => match control.try_recv() {
-                    Ok(signal) => Some(signal),
-                    Err(TryRecvError::Disconnected) | Err(TryRecvError::Empty) => {
-                        messages.blocking_recv().and_then(|queued| {
-                            Self::accept_queued_message(&message_generation, queued)
-                        })
-                    }
-                },
-                MailboxReceiverInner::Unbounded { messages, control } => match control.try_recv() {
-                    Ok(signal) => Some(signal),
-                    Err(TryRecvError::Disconnected) | Err(TryRecvError::Empty) => {
-                        messages.blocking_recv().and_then(|queued| {
-                            Self::accept_queued_message(&message_generation, queued)
-                        })
-                    }
-                },
-            };
-
-            if signal.is_some() || (self.is_closed() && self.is_empty()) {
-                break signal;
-            }
-        };
-
-        if let Some(signal) = &signal {
-            self.record_received_signal(signal);
-        }
-
-        signal
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime can drive blocking mailbox receive");
+        runtime.block_on(self.recv())
     }
 
     /// Variant of [`Self::recv_many`] for blocking contexts.

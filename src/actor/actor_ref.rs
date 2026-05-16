@@ -91,6 +91,10 @@ where
 
     /// Returns whether the actor is accepting ordinary messages.
     ///
+    /// Prefer this method over [`Self::is_alive`] when checking whether user messages can
+    /// still be sent. Use [`Self::is_terminated`] or [`Self::wait_for_shutdown`] for terminal
+    /// lifecycle state.
+    ///
     /// This becomes false as soon as shutdown begins. Lifecycle/control signals may still be
     /// accepted internally until shutdown reaches its terminal outcome.
     #[inline]
@@ -105,6 +109,10 @@ where
     }
 
     /// Returns whether the actor is accepting ordinary messages.
+    ///
+    /// This name is kept for compatibility. New code should prefer
+    /// [`Self::is_accepting_messages`] for sendability and [`Self::is_terminated`] for terminal
+    /// lifecycle state.
     #[inline]
     pub fn is_alive(&self) -> bool {
         self.is_accepting_messages()
@@ -263,10 +271,12 @@ where
             .unwrap_or(false)
     }
 
-    /// Signals the actor to stop after the current in-flight message completes.
+    /// Signals the actor to stop.
     ///
     /// The stop signal uses the lifecycle control lane. Ordinary queued messages do not block it,
-    /// and ordinary message admission closes before cleanup starts.
+    /// and ordinary message admission closes before cleanup starts. The current in-flight ordinary
+    /// message is allowed to finish. Ordinary messages not yet being handled are discarded once
+    /// the stop signal is processed instead of being drained.
     #[inline]
     pub async fn stop_gracefully(&self) -> Result<(), SendError> {
         self.mailbox_sender
@@ -398,12 +408,15 @@ where
         }
     }
 
-    /// Returns the shutdown result if the actor has finished shutting down, or `None` if the
-    /// actor is still running.
+    /// Returns the compatibility shutdown result if the actor has finished shutting down, or
+    /// `None` if the actor is still running.
     ///
     /// Unlike [`wait_for_shutdown_result`](ActorRef::wait_for_shutdown_result), this method does
     /// not block — it returns immediately with `None` if the actor has not yet completed its
     /// [`on_stop`](Actor::on_stop) hook.
+    ///
+    /// New lifecycle-sensitive code should prefer [`wait_for_shutdown`](Self::wait_for_shutdown),
+    /// which waits for the terminal lifecycle outcome.
     ///
     /// Note: This method does not initiate the stop process. Use
     /// [`stop_gracefully`](ActorRef::stop_gracefully) or [`kill`](ActorRef::kill) to signal
@@ -445,6 +458,9 @@ where
     where
         A::Error: Clone,
     {
+        if !self.is_terminated() {
+            return None;
+        }
         match self.shutdown_result.get()? {
             Ok(reason) => Some(Ok(reason.clone())),
             Err(err) => Some(Err(err
@@ -501,6 +517,9 @@ where
     where
         F: FnOnce(Result<&ActorStopReason, HookError<&A::Error>>) -> R,
     {
+        if !self.is_terminated() {
+            return None;
+        }
         match self.shutdown_result.get()? {
             Ok(reason) => Some(f(Ok(reason))),
             Err(err) => match err.err.lock() {
