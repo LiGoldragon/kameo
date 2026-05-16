@@ -501,6 +501,57 @@ async fn wait_for_shutdown_returns_after_cleanup_drop_and_notifications() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn weak_shutdown_result_helpers_wait_for_terminal_lifecycle() {
+    let (actor, _probe, mut stop_receiver, mut drop_receiver) =
+        ActorScenario::delayed_stop().resource_actor();
+    let actor_reference = ResourceActor::spawn_in_thread(actor);
+    let weak_actor_reference = actor_reference.downgrade();
+
+    actor_reference.wait_for_startup().await;
+    actor_reference
+        .stop_gracefully()
+        .await
+        .expect("actor accepts graceful stop");
+    tokio::time::timeout(Duration::from_secs(1), &mut stop_receiver)
+        .await
+        .expect("on_stop completed before timeout")
+        .expect("on_stop witness sender remains alive");
+
+    assert!(
+        !weak_actor_reference.is_terminated(),
+        "the actor is not terminal while its state is still dropping"
+    );
+    assert!(
+        weak_actor_reference.get_shutdown_result().is_none(),
+        "weak shutdown result is hidden until terminal lifecycle publication"
+    );
+    assert!(
+        weak_actor_reference
+            .with_shutdown_result(|_shutdown_result| ())
+            .is_none(),
+        "weak shutdown-result closure is hidden until terminal lifecycle publication"
+    );
+
+    let outcome = weak_actor_reference.wait_for_shutdown().await;
+    assert_eq!(outcome.state, ActorStateAbsence::Dropped);
+    assert_eq!(outcome.reason, ActorTerminalReason::Stopped);
+    tokio::time::timeout(Duration::from_millis(20), &mut drop_receiver)
+        .await
+        .expect("actor dropped before weak wait_for_shutdown returned")
+        .expect("drop witness sender remains alive");
+    assert!(
+        weak_actor_reference.get_shutdown_result().is_some(),
+        "weak shutdown result is visible after terminal lifecycle publication"
+    );
+    assert!(
+        weak_actor_reference
+            .with_shutdown_result(|_shutdown_result| ())
+            .is_some(),
+        "weak shutdown-result closure runs after terminal lifecycle publication"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn message_admission_stops_before_cleanup_finishes() {
     let (cleanup_started_sender, cleanup_started_receiver) = oneshot::channel();
     let (cleanup_release_sender, cleanup_release_receiver) = oneshot::channel();

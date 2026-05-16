@@ -2417,6 +2417,9 @@ impl<A: Actor> WeakActorRef<A> {
     where
         A::Error: Clone,
     {
+        if !self.is_terminated() {
+            return None;
+        }
         match self.shutdown_result.get()? {
             Ok(reason) => Some(Ok(reason.clone())),
             Err(err) => Some(Err(err
@@ -2433,6 +2436,9 @@ impl<A: Actor> WeakActorRef<A> {
     where
         F: FnOnce(Result<&ActorStopReason, HookError<&A::Error>>) -> R,
     {
+        if !self.is_terminated() {
+            return None;
+        }
         match self.shutdown_result.get()? {
             Ok(reason) => Some(f(Ok(reason))),
             Err(err) => match err.err.lock() {
