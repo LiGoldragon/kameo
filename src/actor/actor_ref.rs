@@ -263,10 +263,10 @@ where
             .unwrap_or(false)
     }
 
-    /// Signals the actor to stop after processing all messages currently in its mailbox.
+    /// Signals the actor to stop after the current in-flight message completes.
     ///
-    /// This method ensures that the actor finishes processing any messages that were already in the queue
-    /// before it shuts down. Any new messages sent after the stop signal will be ignored.
+    /// The stop signal uses the lifecycle control lane. Ordinary queued messages do not block it,
+    /// and ordinary message admission closes before cleanup starts.
     #[inline]
     pub async fn stop_gracefully(&self) -> Result<(), SendError> {
         self.mailbox_sender
@@ -1522,7 +1522,7 @@ impl<M: Send + 'static, Ok: Send + 'static, Err: ReplyError> ReplyRecipient<M, O
         self.handler.is_current()
     }
 
-    /// Signals the actor to stop after processing all messages currently in its mailbox.
+    /// Signals the actor to stop after the current in-flight message completes.
     ///
     /// See [`ActorRef::stop_gracefully`].
     #[inline]
@@ -1688,7 +1688,7 @@ impl<M: Send + 'static> Recipient<M> {
         self.handler.is_current()
     }
 
-    /// Signals the actor to stop after processing all messages currently in its mailbox.
+    /// Signals the actor to stop after the current in-flight message completes.
     ///
     /// See [`ActorRef::stop_gracefully`].
     #[inline]

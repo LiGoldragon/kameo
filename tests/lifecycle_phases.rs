@@ -14,6 +14,7 @@ use kameo::{
         Spawn, WeakActorRef,
     },
     error::{ActorStopReason, Infallible},
+    mailbox,
     message::{Context, Message},
     supervision::{RestartPolicy, SupervisionStrategy},
 };
@@ -370,6 +371,73 @@ impl Message<AdmissionProbe> for AdmissionActor {
     }
 }
 
+struct QueueBlockedActor {
+    handler_started_sender: Option<oneshot::Sender<()>>,
+    handler_release_receiver: Option<oneshot::Receiver<()>>,
+    user_work_count: Arc<AtomicUsize>,
+}
+
+impl QueueBlockedActor {
+    fn new(
+        handler_started_sender: oneshot::Sender<()>,
+        handler_release_receiver: oneshot::Receiver<()>,
+        user_work_count: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            handler_started_sender: Some(handler_started_sender),
+            handler_release_receiver: Some(handler_release_receiver),
+            user_work_count,
+        }
+    }
+}
+
+impl Actor for QueueBlockedActor {
+    type Args = Self;
+    type Error = Infallible;
+
+    async fn on_start(
+        state: Self::Args,
+        _actor_reference: ActorRef<Self>,
+    ) -> Result<Self, Self::Error> {
+        Ok(state)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BlockUserHandler;
+
+impl Message<BlockUserHandler> for QueueBlockedActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        _message: BlockUserHandler,
+        _context: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        if let Some(sender) = self.handler_started_sender.take() {
+            let _ = sender.send(());
+        }
+        if let Some(receiver) = self.handler_release_receiver.take() {
+            let _ = receiver.await;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UserWork;
+
+impl Message<UserWork> for QueueBlockedActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        _message: UserWork,
+        _context: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.user_work_count.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 struct ActorScenario {
     stop_delay: Duration,
 }
@@ -508,6 +576,165 @@ async fn link_signal_delivers_terminal_outcome_to_actor_hook() {
         .await
         .expect("observer accepts graceful stop");
     observer.wait_for_shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_signals_do_not_wait_for_bounded_user_mailbox_capacity() {
+    let (handler_started_sender, handler_started_receiver) = oneshot::channel();
+    let (handler_release_sender, handler_release_receiver) = oneshot::channel();
+    let user_work_count = Arc::new(AtomicUsize::new(0));
+    let observer = QueueBlockedActor::spawn_with_mailbox(
+        QueueBlockedActor::new(
+            handler_started_sender,
+            handler_release_receiver,
+            user_work_count.clone(),
+        ),
+        mailbox::bounded(1),
+    );
+
+    observer.wait_for_startup().await;
+    observer
+        .tell(BlockUserHandler)
+        .send()
+        .await
+        .expect("observer accepts handler blocker");
+    handler_started_receiver
+        .await
+        .expect("handler start witness sender remains alive");
+    let mut accepted_user_work = 0;
+    loop {
+        match observer.tell(UserWork).try_send() {
+            Ok(()) => {
+                accepted_user_work += 1;
+                assert!(
+                    accepted_user_work <= 16,
+                    "bounded mailbox should report full after finite user work"
+                );
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            Err(kameo::error::SendError::MailboxFull(_)) => break,
+            Err(error) => {
+                panic!("observer should stay alive while filling user mailbox: {error:?}")
+            }
+        }
+    }
+    assert!(accepted_user_work > 0, "bounded mailbox accepted user work");
+
+    let (linked_actor, _probe, _stop_receiver, _drop_receiver) =
+        ActorScenario::delayed_stop().resource_actor();
+    let linked_actor = ResourceActor::spawn(linked_actor);
+    linked_actor.link(&observer).await;
+    linked_actor
+        .stop_gracefully()
+        .await
+        .expect("linked actor accepts graceful stop");
+
+    let linked_actor_outcome =
+        tokio::time::timeout(Duration::from_secs(1), linked_actor.wait_for_shutdown())
+            .await
+            .expect("link death dispatch does not wait for observer user-mailbox capacity");
+    assert_eq!(linked_actor_outcome.state, ActorStateAbsence::Dropped);
+    assert_eq!(linked_actor_outcome.reason, ActorTerminalReason::Stopped);
+
+    observer
+        .stop_gracefully()
+        .await
+        .expect("observer accepts graceful stop through the control lane");
+    handler_release_sender
+        .send(())
+        .expect("handler release receiver remains alive");
+    let observer_outcome = observer.wait_for_shutdown().await;
+    assert_eq!(observer_outcome.state, ActorStateAbsence::Dropped);
+    assert_eq!(observer_outcome.reason, ActorTerminalReason::Stopped);
+    assert_eq!(
+        user_work_count.load(Ordering::SeqCst),
+        0,
+        "the stop control signal wins over queued ordinary user work"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_bounded_user_send_cannot_cross_closed_admission() {
+    let (handler_started_sender, handler_started_receiver) = oneshot::channel();
+    let (handler_release_sender, handler_release_receiver) = oneshot::channel();
+    let user_work_count = Arc::new(AtomicUsize::new(0));
+    let actor_reference = QueueBlockedActor::spawn_with_mailbox(
+        QueueBlockedActor::new(
+            handler_started_sender,
+            handler_release_receiver,
+            user_work_count.clone(),
+        ),
+        mailbox::bounded(1),
+    );
+
+    actor_reference.wait_for_startup().await;
+    actor_reference
+        .tell(BlockUserHandler)
+        .send()
+        .await
+        .expect("actor accepts handler blocker");
+    handler_started_receiver
+        .await
+        .expect("handler start witness sender remains alive");
+    let mut accepted_user_work = 0;
+    loop {
+        match actor_reference.tell(UserWork).try_send() {
+            Ok(()) => {
+                accepted_user_work += 1;
+                assert!(
+                    accepted_user_work <= 16,
+                    "bounded mailbox should report full after finite user work"
+                );
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            Err(kameo::error::SendError::MailboxFull(_)) => break,
+            Err(error) => panic!("actor should stay alive while filling user mailbox: {error:?}"),
+        }
+    }
+    assert!(accepted_user_work > 0, "bounded mailbox accepted user work");
+
+    let pending_actor_reference = actor_reference.clone();
+    let pending_send =
+        tokio::spawn(async move { pending_actor_reference.tell(UserWork).send().await });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    if pending_send.is_finished() {
+        let pending_result = pending_send
+            .await
+            .expect("pending send task does not panic");
+        panic!(
+            "third user message resolved before bounded mailbox capacity opened: {pending_result:?}"
+        );
+    }
+
+    actor_reference
+        .stop_gracefully()
+        .await
+        .expect("actor accepts graceful stop through the control lane");
+    handler_release_sender
+        .send(())
+        .expect("handler release receiver remains alive");
+
+    let outcome = actor_reference.wait_for_shutdown().await;
+    assert_eq!(outcome.state, ActorStateAbsence::Dropped);
+    assert_eq!(outcome.reason, ActorTerminalReason::Stopped);
+
+    let pending_result = tokio::time::timeout(Duration::from_secs(1), pending_send)
+        .await
+        .expect("pending bounded send resolves after receiver shutdown")
+        .expect("pending send task does not panic");
+    assert!(
+        matches!(
+            pending_result,
+            Err(kameo::error::SendError::ActorNotRunning(_))
+        ),
+        "pending bounded send must not report success after admission closes"
+    );
+    assert_eq!(
+        user_work_count.load(Ordering::SeqCst),
+        0,
+        "ordinary user work queued before shutdown is not processed after stop control wins"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
