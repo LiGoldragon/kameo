@@ -698,6 +698,7 @@ fn new_factory<C: Actor>(
                 // left by a previous supervisor shutdown.
                 inner.parent_shutdown.store(false, Ordering::Release);
             }
+            mailbox_tx.open_message_admission();
             let prepared = PreparedActor::new_with(actor_id, (mailbox_tx, mailbox_rx), links);
             let actor_ref = prepared.actor_ref().clone();
             if in_thread {
@@ -741,7 +742,7 @@ mod tests {
     };
 
     use crate::{
-        actor::{Actor, ActorRef, Spawn, WeakActorRef},
+        actor::{Actor, ActorRef, ActorTerminalOutcome, Spawn, WeakActorRef},
         error::{ActorStopReason, Infallible},
         message::{Context, Message},
         supervision::{RestartPolicy, SupervisionStrategy},
@@ -924,6 +925,7 @@ mod tests {
             &mut self,
             _actor_ref: WeakActorRef<Self>,
             _id: crate::actor::ActorId,
+            _outcome: ActorTerminalOutcome,
             _reason: ActorStopReason,
         ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
             self.link_died_count.fetch_add(1, Ordering::SeqCst);

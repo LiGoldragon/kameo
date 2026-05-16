@@ -76,6 +76,7 @@ impl ToTokens for DeriveRemoteActor {
                               dead_actor_id: ::kameo::actor::ActorId,
                               notified_actor_id: ::kameo::actor::ActorId,
                               stop_reason: kameo::error::ActorStopReason,
+                              outcome: ::kameo::actor::ActorTerminalOutcome,
                             | {
                                 ::std::boxed::Box::pin(::kameo::remote::_internal::signal_link_died::<
                                     #ident #ty_generics,
@@ -83,6 +84,7 @@ impl ToTokens for DeriveRemoteActor {
                                     dead_actor_id,
                                     notified_actor_id,
                                     stop_reason,
+                                    outcome,
                                 ))
                             }) as ::kameo::remote::_internal::RemoteSignalLinkDiedFn,
                     },

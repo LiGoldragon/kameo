@@ -8,7 +8,7 @@ pub use linkme;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::actor::ActorId;
+use crate::actor::{ActorId, ActorTerminalOutcome};
 use crate::error::{ActorStopReason, Infallible, RemoteSendError};
 use crate::links::Link;
 use crate::message::Message;
@@ -74,6 +74,7 @@ pub type RemoteSignalLinkDiedFn = fn(
     dead_actor_id: ActorId,
     notified_actor_id: ActorId,
     stop_reason: ActorStopReason,
+    outcome: ActorTerminalOutcome,
 )
     -> BoxFuture<'static, Result<(), RemoteSendError<Infallible>>>;
 
@@ -263,6 +264,7 @@ pub async fn signal_link_died<A>(
     dead_actor_id: ActorId,
     notified_actor_id: ActorId,
     stop_reason: ActorStopReason,
+    outcome: ActorTerminalOutcome,
 ) -> Result<(), RemoteSendError<Infallible>>
 where
     A: Actor,
@@ -277,7 +279,7 @@ where
 
     actor_ref
         .weak_signal_mailbox()
-        .signal_link_died(dead_actor_id, stop_reason, None, None)
+        .signal_link_died(dead_actor_id, stop_reason, outcome, None, None)
         .await?;
 
     Ok(())

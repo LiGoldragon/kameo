@@ -12,7 +12,7 @@ use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use tracing::Instrument;
 
 use crate::{
-    actor::{Actor, ActorRef, WeakActorRef},
+    actor::{Actor, ActorRef, ActorTerminalOutcome, WeakActorRef},
     error::{ActorStopReason, PanicError, PanicReason},
     links::{BoxMailboxReceiver, Link, ShutdownFn},
     mailbox::{MailboxReceiver, Signal},
@@ -207,6 +207,7 @@ where
         &mut self,
         id: ActorId,
         reason: ActorStopReason,
+        outcome: ActorTerminalOutcome,
         mailbox_rx: Option<Box<dyn Any + Send>>,
         dead_actor_sibblings: Option<HashMap<ActorId, Link>>,
     ) -> ControlFlow<ActorStopReason> {
@@ -236,7 +237,7 @@ where
             }
 
             if let Some(spec) = links.children.get_mut(&id) {
-                let should_restart = spec.should_restart(&reason);
+                let should_restart = spec.should_restart(&outcome);
                 let factory = Arc::clone(&spec.factory);
                 #[cfg(feature = "tracing")]
                 let restart_count = spec.restart_count;
@@ -351,13 +352,18 @@ where
                             let mut notify_futs: FuturesUnordered<_> = sibblings
                                 .into_iter()
                                 .map(|(sibbling_actor_id, link)| {
-                                    link.notify(sibbling_actor_id, id, reason.clone(), None, None)
-                                        .boxed()
+                                    link.notify(
+                                        sibbling_actor_id,
+                                        id,
+                                        reason.clone(),
+                                        outcome,
+                                        None,
+                                        None,
+                                    )
+                                    .boxed()
                                 })
                                 .collect();
-                            tokio::spawn(async move {
-                                while let Some(()) = notify_futs.next().await {}
-                            });
+                            while let Some(()) = notify_futs.next().await {}
                         }
                     }
                 }
@@ -367,6 +373,7 @@ where
         let res = AssertUnwindSafe(self.state.on_link_died(
             self.actor_ref.clone(),
             id,
+            outcome,
             reason.clone(),
         ))
         .catch_unwind()

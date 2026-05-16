@@ -1,6 +1,8 @@
 use std::{ops::ControlFlow, time::Duration};
 
-use kameo::{error::Infallible, prelude::*, supervision::SupervisionStrategy};
+use kameo::{
+    actor::ActorTerminalOutcome, error::Infallible, prelude::*, supervision::SupervisionStrategy,
+};
 use tracing::{Level, info};
 
 #[derive(Default)]
@@ -103,6 +105,7 @@ impl Actor for BrotherActor {
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         _id: ActorId,
+        _outcome: ActorTerminalOutcome,
         _reason: ActorStopReason,
     ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
         info!("brother actor received link died");

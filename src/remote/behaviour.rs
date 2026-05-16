@@ -13,7 +13,10 @@ use libp2p::{
 };
 use tokio::sync::mpsc;
 
-use crate::error::{ActorStopReason, SwarmAlreadyBootstrappedError};
+use crate::{
+    actor::ActorTerminalOutcome,
+    error::{ActorStopReason, SwarmAlreadyBootstrappedError},
+};
 
 use super::{
     ActorSwarm, REMOTE_REGISTRY, RemoteRegistryActorRef, SwarmCommand, messaging, registry,
@@ -235,6 +238,7 @@ impl Behaviour {
                 notified_actor_id,
                 notified_actor_remote_id,
                 stop_reason,
+                outcome,
                 reply,
             } => {
                 self.messaging.signal_link_died_with_reply(
@@ -242,6 +246,7 @@ impl Behaviour {
                     notified_actor_id,
                     notified_actor_remote_id,
                     stop_reason,
+                    outcome,
                     Some(reply),
                 );
                 true
@@ -454,6 +459,7 @@ impl NetworkBehaviour for Behaviour {
                                     .signal_link_died(
                                         linked_actor_id,
                                         ActorStopReason::PeerDisconnected,
+                                        ActorTerminalOutcome::peer_disconnected(),
                                         None,
                                         None,
                                     )

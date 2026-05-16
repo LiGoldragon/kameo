@@ -24,6 +24,7 @@
 mod actor_ref;
 mod id;
 mod kind;
+mod lifecycle;
 mod spawn;
 
 use std::{any, ops::ControlFlow};
@@ -40,6 +41,7 @@ use crate::{
 
 pub use actor_ref::*;
 pub use id::*;
+pub use lifecycle::*;
 pub use spawn::*;
 
 pub(crate) const DEFAULT_MAILBOX_CAPACITY: usize = 64;
@@ -284,10 +286,12 @@ pub trait Actor: Sized + Send + 'static {
         async move { Ok(ControlFlow::Break(ActorStopReason::Panicked(err))) }
     }
 
-    /// Called when a linked actor dies.
+    /// Called when a linked actor reaches its terminal outcome.
     ///
-    /// By default, the actor will stop if the reason for the linked actor's death is anything other
-    /// than `Normal`. You can customize this behavior in the implementation.
+    /// By default, the actor will stop if the linked actor's terminal reason is anything other
+    /// than `Stopped` or a supervisor restart. You can customize this behavior in the
+    /// implementation. The `reason` argument preserves legacy stop detail such as panic payloads;
+    /// lifecycle decisions should use `outcome`.
     ///
     /// # Returns
     /// Whether the actor should stop or continue processing messages.
@@ -297,23 +301,26 @@ pub trait Actor: Sized + Send + 'static {
         &mut self,
         actor_ref: WeakActorRef<Self>,
         id: ActorId,
+        outcome: ActorTerminalOutcome,
         reason: ActorStopReason,
     ) -> impl Future<Output = Result<ControlFlow<ActorStopReason>, Self::Error>> + Send {
         async move {
-            match &reason {
-                ActorStopReason::Normal | ActorStopReason::SupervisorRestart => {
+            match outcome.reason {
+                ActorTerminalReason::Stopped | ActorTerminalReason::SupervisorRestart => {
                     Ok(ControlFlow::Continue(()))
                 }
-                ActorStopReason::Killed
-                | ActorStopReason::Panicked(_)
-                | ActorStopReason::LinkDied { .. } => {
+                ActorTerminalReason::Killed
+                | ActorTerminalReason::Panicked
+                | ActorTerminalReason::LinkDied
+                | ActorTerminalReason::CleanupFailed
+                | ActorTerminalReason::StartupFailed => {
                     Ok(ControlFlow::Break(ActorStopReason::LinkDied {
                         id,
                         reason: Box::new(reason),
                     }))
                 }
                 #[cfg(feature = "remote")]
-                ActorStopReason::PeerDisconnected => {
+                ActorTerminalReason::PeerDisconnected => {
                     Ok(ControlFlow::Break(ActorStopReason::PeerDisconnected))
                 }
             }

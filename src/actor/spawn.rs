@@ -16,7 +16,10 @@ use tracing::{Instrument, error, trace};
 use crate::remote;
 
 use crate::{
-    actor::{Actor, ActorRef, CURRENT_ACTOR_ID, kind::ActorBehaviour},
+    actor::{
+        Actor, ActorLifecycle, ActorRef, ActorTerminalOutcome, CURRENT_ACTOR_ID,
+        kind::ActorBehaviour,
+    },
     error::{ActorStopReason, PanicError, PanicReason, SendError, invoke_actor_error_hook},
     links::Links,
     mailbox::{MailboxReceiver, MailboxSender, Signal},
@@ -61,6 +64,7 @@ impl<A: Actor> PreparedActor<A> {
         let (abort_handle, abort_registration) = AbortHandle::new_pair();
         let startup_result = Arc::new(SetOnce::new());
         let shutdown_result = Arc::new(SetOnce::new());
+        let lifecycle = ActorLifecycle::new();
         let actor_ref = ActorRef::new(
             actor_id,
             mailbox_tx,
@@ -68,6 +72,7 @@ impl<A: Actor> PreparedActor<A> {
             links,
             startup_result,
             shutdown_result,
+            lifecycle,
         );
 
         PreparedActor {
@@ -115,7 +120,7 @@ impl<A: Actor> PreparedActor<A> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// ```
-    pub async fn run(self, args: A::Args) -> Result<(A, ActorStopReason), PanicError> {
+    pub async fn run(self, args: A::Args) -> Result<ActorStopReason, PanicError> {
         run_actor_lifecycle::<A>(
             args,
             self.actor_ref,
@@ -128,7 +133,7 @@ impl<A: Actor> PreparedActor<A> {
     /// Spawns the actor in a new background tokio task, returning the `JoinHandle`.
     ///
     /// See [`Spawn::spawn`](crate::actor::Spawn::spawn) for more information.
-    pub fn spawn(self, args: A::Args) -> JoinHandle<Result<(A, ActorStopReason), PanicError>> {
+    pub fn spawn(self, args: A::Args) -> JoinHandle<Result<ActorStopReason, PanicError>> {
         #[cfg(not(all(tokio_unstable, feature = "tracing")))]
         {
             tokio::spawn(CURRENT_ACTOR_ID.scope(self.actor_ref.id(), self.run(args)))
@@ -149,7 +154,7 @@ impl<A: Actor> PreparedActor<A> {
     pub fn spawn_in_thread(
         self,
         args: A::Args,
-    ) -> thread::JoinHandle<Result<(A, ActorStopReason), PanicError>> {
+    ) -> thread::JoinHandle<Result<ActorStopReason, PanicError>> {
         let handle = Handle::current();
         if matches!(handle.runtime_flavor(), RuntimeFlavor::CurrentThread) {
             panic!("threaded actors are not supported in a single threaded tokio runtime");
@@ -170,7 +175,7 @@ async fn run_actor_lifecycle<A>(
     actor_ref: ActorRef<A>,
     mut mailbox_rx: MailboxReceiver<A>,
     abort_registration: AbortRegistration,
-) -> Result<(A, ActorStopReason), PanicError>
+) -> Result<ActorStopReason, PanicError>
 where
     A: Actor,
 {
@@ -211,6 +216,7 @@ where
                 .await
                 .unwrap_or(ActorStopReason::Killed);
 
+                actor_ref.stop_message_admission();
                 let mut actor = state.shutdown().await;
 
                 actor_ref.links.set_children_parent_shutdown().await;
@@ -225,38 +231,47 @@ where
                         }
                     }
                 }
-                actor_ref
-                    .links
-                    .lock()
-                    .await
-                    .notify_links(id, reason.clone(), mailbox_rx);
-
                 log_actor_stop_reason(id, name, &reason);
                 let on_stop_res = actor.on_stop(actor_ref.clone(), reason.clone()).await;
 
-                unregister_actor(&id).await;
-
                 match on_stop_res {
                     Ok(()) => {
+                        let outcome = ActorTerminalOutcome::dropped(reason.clone());
+                        drop(actor);
+                        actor_ref
+                            .links
+                            .notify_links(id, reason.clone(), outcome, mailbox_rx)
+                            .await;
+                        unregister_actor(&id).await;
                         actor_ref
                             .shutdown_result
                             .set(Ok(reason.clone()))
                             .expect("nothing else should set the shutdown result");
+                        actor_ref.lifecycle.set_terminal_outcome(outcome);
                     }
                     Err(err) => {
                         let err = PanicError::new(Box::new(err), PanicReason::OnStop);
                         invoke_actor_error_hook(&err);
 
+                        let outcome = ActorTerminalOutcome::cleanup_failed();
+                        drop(actor);
+                        actor_ref
+                            .links
+                            .notify_links(id, reason.clone(), outcome, mailbox_rx)
+                            .await;
+                        unregister_actor(&id).await;
                         actor_ref
                             .shutdown_result
                             .set(Err(err))
                             .expect("nothing else should set the shutdown result");
+                        actor_ref.lifecycle.set_terminal_outcome(outcome);
                     }
                 }
 
-                Ok((actor, reason))
+                Ok(reason)
             }
             Err(err) => {
+                actor_ref.stop_message_admission();
                 actor_ref
                     .startup_result
                     .set(Err(err.clone()))
@@ -277,12 +292,11 @@ where
                         }
                     }
                 }
+                let outcome = ActorTerminalOutcome::startup_failed();
                 actor_ref
                     .links
-                    .lock()
-                    .await
-                    .notify_links(id, reason.clone(), mailbox_rx);
-
+                    .notify_links(id, reason.clone(), outcome, mailbox_rx)
+                    .await;
                 unregister_actor(&id).await;
 
                 let ActorStopReason::Panicked(err) = reason else {
@@ -293,6 +307,7 @@ where
                     .shutdown_result
                     .set(Err(err.clone()))
                     .expect("nothing should set the startup result");
+                actor_ref.lifecycle.set_terminal_outcome(outcome);
 
                 Err(err)
             }
@@ -377,11 +392,12 @@ where
             ControlFlow::Continue(Signal::LinkDied {
                 id,
                 reason,
+                outcome,
                 mailbox_rx,
                 dead_actor_sibblings,
             }) => {
                 if let ControlFlow::Break(reason) = state
-                    .handle_link_died(id, reason, mailbox_rx, dead_actor_sibblings)
+                    .handle_link_died(id, reason, outcome, mailbox_rx, dead_actor_sibblings)
                     .await
                 {
                     return reason;

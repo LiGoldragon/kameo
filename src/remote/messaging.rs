@@ -50,7 +50,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{sync::oneshot, task::JoinSet};
 
 use crate::{
-    actor::ActorId,
+    actor::{ActorId, ActorTerminalOutcome},
     error::{ActorStopReason, Infallible, RemoteSendError},
 };
 
@@ -214,6 +214,8 @@ pub enum SwarmRequest {
         notified_actor_remote_id: Cow<'static, str>,
         /// The reason the actor died.
         stop_reason: ActorStopReason,
+        /// The terminal outcome published by the actor that died.
+        outcome: ActorTerminalOutcome,
     },
 }
 
@@ -625,12 +627,15 @@ impl Behaviour {
         notified_actor_remote_id: Cow<'static, str>,
         // The reason the actor died.
         stop_reason: ActorStopReason,
+        // The terminal outcome published by the actor that died.
+        outcome: ActorTerminalOutcome,
     ) -> RequestId {
         self.signal_link_died_with_reply(
             dead_actor_id,
             notified_actor_id,
             notified_actor_remote_id,
             stop_reason,
+            outcome,
             None,
         )
         .unwrap()
@@ -815,6 +820,7 @@ impl Behaviour {
         notified_actor_id: ActorId,
         notified_actor_remote_id: Cow<'static, str>,
         stop_reason: ActorStopReason,
+        outcome: ActorTerminalOutcome,
         reply: Option<oneshot::Sender<SwarmResponse>>,
     ) -> Option<RequestId> {
         let peer_id = notified_actor_id
@@ -828,22 +834,31 @@ impl Behaviour {
                 notified_actor_id,
                 notified_actor_remote_id,
                 stop_reason,
+                outcome,
             ),
-            |(dead_actor_id, notified_actor_id, notified_actor_remote_id, stop_reason)| {
+            |(dead_actor_id, notified_actor_id, notified_actor_remote_id, stop_reason, outcome)| {
                 signal_link_died(
                     dead_actor_id,
                     notified_actor_id,
                     notified_actor_remote_id,
                     stop_reason,
+                    outcome,
                 )
                 .map(SwarmResponse::SignalLinkDied)
             },
-            move |(dead_actor_id, notified_actor_id, notified_actor_remote_id, stop_reason)| {
+            move |(
+                dead_actor_id,
+                notified_actor_id,
+                notified_actor_remote_id,
+                stop_reason,
+                outcome,
+            )| {
                 SwarmRequest::SignalLinkDied {
                     dead_actor_id,
                     notified_actor_id,
                     notified_actor_remote_id,
                     stop_reason,
+                    outcome,
                 }
             },
         )
@@ -1042,6 +1057,7 @@ impl Behaviour {
                 notified_actor_id,
                 notified_actor_remote_id,
                 stop_reason,
+                outcome,
             } => {
                 self.join_set.spawn(
                     signal_link_died(
@@ -1049,6 +1065,7 @@ impl Behaviour {
                         notified_actor_id,
                         notified_actor_remote_id,
                         stop_reason,
+                        outcome,
                     )
                     .map(|res| (channel, SwarmResponse::SignalLinkDied(res))),
                 );
@@ -1389,6 +1406,7 @@ async fn signal_link_died(
     notified_actor_id: ActorId,
     notified_actor_remote_id: Cow<'static, str>,
     stop_reason: ActorStopReason,
+    outcome: ActorTerminalOutcome,
 ) -> Result<(), RemoteSendError<Infallible>> {
     let Some(fns) = REMOTE_ACTORS_MAP.get(&*notified_actor_remote_id) else {
         return Err(RemoteSendError::UnknownActor {
@@ -1396,5 +1414,5 @@ async fn signal_link_died(
         });
     };
 
-    (fns.signal_link_died)(dead_actor_id, notified_actor_id, stop_reason).await
+    (fns.signal_link_died)(dead_actor_id, notified_actor_id, stop_reason, outcome).await
 }

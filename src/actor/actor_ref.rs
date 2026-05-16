@@ -31,7 +31,10 @@ use crate::{
     },
 };
 
-use super::id::ActorId;
+use super::{
+    id::ActorId,
+    lifecycle::{ActorLifecycle, ActorTerminalOutcome},
+};
 
 task_local! {
     pub(crate) static CURRENT_ACTOR_ID: ActorId;
@@ -52,6 +55,7 @@ pub struct ActorRef<A: Actor> {
     pub(crate) links: Links,
     pub(crate) startup_result: Arc<SetOnce<Result<(), PanicError>>>,
     pub(crate) shutdown_result: Arc<SetOnce<Result<ActorStopReason, PanicError>>>,
+    pub(crate) lifecycle: ActorLifecycle,
 }
 
 impl<A> ActorRef<A>
@@ -66,6 +70,7 @@ where
         links: Links,
         startup_result: Arc<SetOnce<Result<(), PanicError>>>,
         shutdown_result: Arc<SetOnce<Result<ActorStopReason, PanicError>>>,
+        lifecycle: ActorLifecycle,
     ) -> Self {
         ActorRef {
             id,
@@ -74,6 +79,7 @@ where
             links,
             startup_result,
             shutdown_result,
+            lifecycle,
         }
     }
 
@@ -83,10 +89,25 @@ where
         self.id
     }
 
-    /// Returns whether the actor is currently alive.
+    /// Returns whether the actor is accepting ordinary messages.
+    ///
+    /// This becomes false as soon as shutdown begins. Lifecycle/control signals may still be
+    /// accepted internally until shutdown reaches its terminal outcome.
+    #[inline]
+    pub fn is_accepting_messages(&self) -> bool {
+        self.mailbox_sender.is_accepting_messages()
+    }
+
+    /// Returns whether the actor has published its terminal outcome.
+    #[inline]
+    pub fn is_terminated(&self) -> bool {
+        self.lifecycle.is_terminated()
+    }
+
+    /// Returns whether the actor is accepting ordinary messages.
     #[inline]
     pub fn is_alive(&self) -> bool {
-        !self.mailbox_sender.is_closed()
+        self.is_accepting_messages()
     }
 
     /// Registers the actor under a given name in the actor registry.
@@ -203,6 +224,7 @@ where
             links: self.links.clone(),
             startup_result: self.startup_result.clone(),
             shutdown_result: self.shutdown_result.clone(),
+            lifecycle: self.lifecycle.clone(),
         }
     }
 
@@ -214,6 +236,7 @@ where
             links: self.links,
             startup_result: self.startup_result,
             shutdown_result: self.shutdown_result,
+            lifecycle: self.lifecycle,
         }
     }
 
@@ -644,8 +667,8 @@ where
     /// stop. You should signal the actor to stop using [`stop_gracefully`](ActorRef::stop_gracefully) or [`kill`](ActorRef::kill)
     /// before calling this method.
     #[inline]
-    pub async fn wait_for_shutdown(&self) {
-        self.mailbox_sender.closed().await
+    pub async fn wait_for_shutdown(&self) -> ActorTerminalOutcome {
+        self.lifecycle.wait_for_shutdown().await
     }
 
     /// Waits for the actor to finish shutdown, returning the shutdown result with a clone of the error.
@@ -716,7 +739,7 @@ where
     where
         A::Error: Clone,
     {
-        self.mailbox_sender.closed().await;
+        self.lifecycle.wait_for_shutdown().await;
         match self.shutdown_result.wait().await {
             Ok(reason) => Ok(reason.clone()),
             Err(err) => Err(err
@@ -797,7 +820,7 @@ where
     where
         F: FnOnce(Result<&ActorStopReason, HookError<&A::Error>>) -> R,
     {
-        self.mailbox_sender.closed().await;
+        self.lifecycle.wait_for_shutdown().await;
         match self.shutdown_result.wait().await {
             Ok(reason) => f(Ok(reason)),
             Err(err) => match err.err.lock() {
@@ -1371,6 +1394,7 @@ impl<A: Actor> Clone for ActorRef<A> {
             links: self.links.clone(),
             startup_result: self.startup_result.clone(),
             shutdown_result: self.shutdown_result.clone(),
+            lifecycle: self.lifecycle.clone(),
         }
     }
 }
@@ -1526,7 +1550,7 @@ impl<M: Send + 'static, Ok: Send + 'static, Err: ReplyError> ReplyRecipient<M, O
     ///
     /// See [`ActorRef::wait_for_shutdown`].
     #[inline]
-    pub async fn wait_for_shutdown(&self) {
+    pub async fn wait_for_shutdown(&self) -> ActorTerminalOutcome {
         self.handler.wait_for_shutdown().await
     }
 
@@ -1692,7 +1716,7 @@ impl<M: Send + 'static> Recipient<M> {
     ///
     /// See [`ActorRef::wait_for_shutdown`].
     #[inline]
-    pub async fn wait_for_shutdown(&self) {
+    pub async fn wait_for_shutdown(&self) -> ActorTerminalOutcome {
         self.handler.wait_for_shutdown().await
     }
 
@@ -2156,6 +2180,7 @@ pub struct WeakActorRef<A: Actor> {
     pub(crate) links: Links,
     pub(crate) startup_result: Arc<SetOnce<Result<(), PanicError>>>,
     pub(crate) shutdown_result: Arc<SetOnce<Result<ActorStopReason, PanicError>>>,
+    pub(crate) lifecycle: ActorLifecycle,
 }
 
 impl<A: Actor> WeakActorRef<A> {
@@ -2164,10 +2189,30 @@ impl<A: Actor> WeakActorRef<A> {
         self.id
     }
 
-    /// Returns whether the actor is currently alive.
+    /// Returns whether the actor is accepting ordinary messages.
+    ///
+    /// This becomes false as soon as shutdown begins. Lifecycle/control signals may still be
+    /// accepted internally until shutdown reaches its terminal outcome.
+    #[inline]
+    pub fn is_accepting_messages(&self) -> bool {
+        self.mailbox_sender.is_accepting_messages()
+    }
+
+    /// Returns whether the actor has published its terminal outcome.
+    #[inline]
+    pub fn is_terminated(&self) -> bool {
+        self.lifecycle.is_terminated()
+    }
+
+    /// Returns whether the actor is accepting ordinary messages.
     #[inline]
     pub fn is_alive(&self) -> bool {
-        !self.shutdown_result.initialized()
+        self.is_accepting_messages()
+    }
+
+    #[inline]
+    pub(crate) fn stop_message_admission(&self) {
+        self.mailbox_sender.stop_message_admission();
     }
 
     /// Tries to convert a `WeakActorRef` into a [`ActorRef`]. This will return `Some`
@@ -2181,6 +2226,7 @@ impl<A: Actor> WeakActorRef<A> {
             links: self.links.clone(),
             startup_result: self.startup_result.clone(),
             shutdown_result: self.shutdown_result.clone(),
+            lifecycle: self.lifecycle.clone(),
         })
     }
 
@@ -2301,8 +2347,8 @@ impl<A: Actor> WeakActorRef<A> {
     ///
     /// See [`ActorRef::wait_for_shutdown`] for full details and examples.
     #[inline]
-    pub async fn wait_for_shutdown(&self) {
-        self.shutdown_result.wait().await;
+    pub async fn wait_for_shutdown(&self) -> ActorTerminalOutcome {
+        self.lifecycle.wait_for_shutdown().await
     }
 
     /// Waits for the actor to finish shutdown, returning the shutdown result with a clone of the error.
@@ -2312,6 +2358,7 @@ impl<A: Actor> WeakActorRef<A> {
     where
         A::Error: Clone,
     {
+        self.lifecycle.wait_for_shutdown().await;
         match self.shutdown_result.wait().await {
             Ok(reason) => Ok(reason.clone()),
             Err(err) => Err(err
@@ -2327,6 +2374,7 @@ impl<A: Actor> WeakActorRef<A> {
     where
         F: FnOnce(Result<&ActorStopReason, HookError<&A::Error>>) -> R,
     {
+        self.lifecycle.wait_for_shutdown().await;
         match self.shutdown_result.wait().await {
             Ok(reason) => f(Ok(reason)),
             Err(err) => match err.err.lock() {
@@ -2476,6 +2524,7 @@ impl<A: Actor> Clone for WeakActorRef<A> {
             links: self.links.clone(),
             startup_result: self.startup_result.clone(),
             shutdown_result: self.shutdown_result.clone(),
+            lifecycle: self.lifecycle.clone(),
         }
     }
 }
@@ -2712,7 +2761,7 @@ pub(crate) trait MessageHandler<M: Send + 'static>:
     fn stop_gracefully(&self) -> BoxFuture<'_, Result<(), SendError>>;
     fn kill(&self);
     fn wait_for_startup(&self) -> BoxFuture<'_, ()>;
-    fn wait_for_shutdown(&self) -> BoxFuture<'_, ()>;
+    fn wait_for_shutdown(&self) -> BoxFuture<'_, ActorTerminalOutcome>;
 
     #[allow(clippy::type_complexity)]
     fn tell(
@@ -2735,6 +2784,7 @@ where
     }
 
     #[inline]
+    #[allow(deprecated)]
     fn is_alive(&self) -> bool {
         self.is_alive()
     }
@@ -2775,7 +2825,7 @@ where
     }
 
     #[inline]
-    fn wait_for_shutdown(&self) -> BoxFuture<'_, ()> {
+    fn wait_for_shutdown(&self) -> BoxFuture<'_, ActorTerminalOutcome> {
         self.wait_for_shutdown().boxed()
     }
 

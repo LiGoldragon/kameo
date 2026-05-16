@@ -18,7 +18,7 @@ use futures::{
 use tokio::sync::Mutex;
 
 use crate::{
-    actor::{Actor, ActorId},
+    actor::{Actor, ActorId, ActorTerminalOutcome},
     error::ActorStopReason,
     mailbox::{MailboxReceiver, SignalMailbox},
     supervision::RestartPolicy,
@@ -76,6 +76,24 @@ impl Links {
 
         join_all(mailboxes.iter().map(|m| m.closed())).await;
     }
+
+    /// Dispatches link and supervision death signals.
+    ///
+    /// This awaits the send operation into each target mailbox or remote link. It
+    /// does not mean the target actor has processed the signal.
+    pub async fn notify_links<A: Actor>(
+        &self,
+        id: ActorId,
+        reason: ActorStopReason,
+        outcome: ActorTerminalOutcome,
+        mailbox_rx: MailboxReceiver<A>,
+    ) {
+        let notification = {
+            let mut inner = self.lock().await;
+            inner.take_link_notification(id, reason, outcome, mailbox_rx)
+        };
+        notification.dispatch().await;
+    }
 }
 
 #[derive(Default)]
@@ -95,12 +113,13 @@ pub struct LinksInner {
 
 impl LinksInner {
     /// Notify parent or sibblings, depending on supervision status.
-    pub fn notify_links<A: Actor>(
+    fn take_link_notification<A: Actor>(
         &mut self,
         id: ActorId,
         reason: ActorStopReason,
+        outcome: ActorTerminalOutcome,
         mailbox_rx: MailboxReceiver<A>,
-    ) {
+    ) -> LinkNotification {
         match self.parent.clone() {
             Some((parent_id, parent_link)) => {
                 let sibblings = mem::take(&mut self.sibblings);
@@ -109,36 +128,104 @@ impl LinksInner {
                     // child's channel closes and the parent's mailbox.closed() wait resolves.
                     // Passing it to the parent's queue would deadlock since the parent is not
                     // processing its mailbox while blocked in shutdown_children.
-                    tokio::spawn(parent_link.notify(parent_id, id, reason, None, None));
+                    LinkNotification::Parent {
+                        link_actor_id: parent_id,
+                        dead_actor_id: id,
+                        reason,
+                        outcome,
+                        mailbox_receiver: None,
+                        dead_actor_siblings: None,
+                        link: parent_link,
+                    }
                 } else {
                     // Supervised normal path — pass mailbox_rx so the parent can restart us.
-                    tokio::spawn(parent_link.notify(
-                        parent_id,
-                        id,
+                    LinkNotification::Parent {
+                        link_actor_id: parent_id,
+                        dead_actor_id: id,
                         reason,
-                        Some(Box::new(mailbox_rx)),
-                        Some(sibblings),
-                    ));
+                        outcome,
+                        mailbox_receiver: Some(Box::new(mailbox_rx)),
+                        dead_actor_siblings: Some(sibblings),
+                        link: parent_link,
+                    }
                 }
             }
             None => {
                 // Unsupervised, notify sibblings directly
-                self.notify_sibblings(id, &reason);
+                LinkNotification::Siblings {
+                    dead_actor_id: id,
+                    reason,
+                    outcome,
+                    siblings: mem::take(&mut self.sibblings),
+                }
             }
         }
     }
+}
 
-    /// Notify sibbling links.
-    pub fn notify_sibblings(&mut self, id: ActorId, reason: &ActorStopReason) {
-        let mut notify_futs: FuturesUnordered<_> = self
-            .sibblings
-            .drain()
-            .map(|(sibbling_actor_id, link)| {
-                link.notify(sibbling_actor_id, id, reason.clone(), None, None)
-                    .boxed()
-            })
-            .collect();
-        tokio::spawn(async move { while let Some(()) = notify_futs.next().await {} });
+enum LinkNotification {
+    Parent {
+        link_actor_id: ActorId,
+        dead_actor_id: ActorId,
+        reason: ActorStopReason,
+        outcome: ActorTerminalOutcome,
+        mailbox_receiver: Option<BoxMailboxReceiver>,
+        dead_actor_siblings: Option<HashMap<ActorId, Link>>,
+        link: Link,
+    },
+    Siblings {
+        dead_actor_id: ActorId,
+        reason: ActorStopReason,
+        outcome: ActorTerminalOutcome,
+        siblings: HashMap<ActorId, Link>,
+    },
+}
+
+impl LinkNotification {
+    async fn dispatch(self) {
+        match self {
+            Self::Parent {
+                link_actor_id,
+                dead_actor_id,
+                reason,
+                outcome,
+                mailbox_receiver,
+                dead_actor_siblings,
+                link,
+            } => {
+                link.notify(
+                    link_actor_id,
+                    dead_actor_id,
+                    reason,
+                    outcome,
+                    mailbox_receiver,
+                    dead_actor_siblings,
+                )
+                .await;
+            }
+            Self::Siblings {
+                dead_actor_id,
+                reason,
+                outcome,
+                siblings,
+            } => {
+                let mut notify_futures: FuturesUnordered<_> = siblings
+                    .into_iter()
+                    .map(|(sibling_actor_id, link)| {
+                        link.notify(
+                            sibling_actor_id,
+                            dead_actor_id,
+                            reason.clone(),
+                            outcome,
+                            None,
+                            None,
+                        )
+                        .boxed()
+                    })
+                    .collect();
+                while let Some(()) = notify_futures.next().await {}
+            }
+        }
     }
 }
 
@@ -165,6 +252,7 @@ impl Link {
         link_actor_id: ActorId,
         dead_actor_id: ActorId,
         reason: ActorStopReason,
+        outcome: ActorTerminalOutcome,
         mailbox_rx: Option<BoxMailboxReceiver>,
         dead_actor_sibblings: Option<HashMap<ActorId, Link>>,
     ) {
@@ -172,7 +260,13 @@ impl Link {
             Link::Local(mailbox) => {
                 #[cfg_attr(not(feature = "tracing"), allow(unused_variables))]
                 if let Err(err) = mailbox
-                    .signal_link_died(dead_actor_id, reason, mailbox_rx, dead_actor_sibblings)
+                    .signal_link_died(
+                        dead_actor_id,
+                        reason,
+                        outcome,
+                        mailbox_rx,
+                        dead_actor_sibblings,
+                    )
                     .await
                 {
                     #[cfg(feature = "tracing")]
@@ -193,6 +287,7 @@ impl Link {
                             link_actor_id,
                             notified_actor_remote_id,
                             reason,
+                            outcome,
                         )
                         .await;
                     #[cfg_attr(not(feature = "tracing"), allow(unused_variables))]
@@ -223,21 +318,27 @@ pub struct ErasedChildSpec {
 }
 
 impl ErasedChildSpec {
-    pub fn should_restart(&mut self, reason: &ActorStopReason) -> ControlFlow<NoRestartReason> {
+    pub fn should_restart(
+        &mut self,
+        outcome: &ActorTerminalOutcome,
+    ) -> ControlFlow<NoRestartReason> {
         // Never policy takes precedence over everything, including coordinator-initiated restarts
         if matches!(self.restart_policy, RestartPolicy::Never) {
             return ControlFlow::Break(NoRestartReason::NeverPolicy);
         }
 
         // Always restart if supervisor initiated the shutdown for coordination
-        if matches!(reason, ActorStopReason::SupervisorRestart) {
+        if matches!(
+            outcome.reason,
+            crate::actor::ActorTerminalReason::SupervisorRestart
+        ) {
             return ControlFlow::Continue(());
         }
 
         // Policy check
         match self.restart_policy {
             RestartPolicy::Permanent => {}
-            RestartPolicy::Transient if reason.is_normal() => {
+            RestartPolicy::Transient if outcome.reason.is_normal() => {
                 return ControlFlow::Break(NoRestartReason::NormalExitUnderTransientPolicy);
             }
             RestartPolicy::Transient => {}

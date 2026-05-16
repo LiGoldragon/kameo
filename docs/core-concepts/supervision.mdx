@@ -173,9 +173,10 @@ impl Actor for WorkerA {
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         id: ActorId,
+        outcome: ActorTerminalOutcome,
         reason: ActorStopReason,
     ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
-        tracing::warn!("linked actor {id} died: {reason:?}");
+        tracing::warn!("linked actor {id} reached {outcome:?}: {reason:?}");
         Ok(ControlFlow::Continue(()))  // Keep running
     }
 }

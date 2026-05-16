@@ -49,7 +49,7 @@ use futures::{
     Future, FutureExt, TryFutureExt,
     future::{BoxFuture, join_all},
 };
-use kameo::{error::Infallible, prelude::*};
+use kameo::{actor::ActorTerminalOutcome, error::Infallible, prelude::*};
 
 enum Factory<A: Actor> {
     Sync(Box<dyn FnMut() -> ActorRef<A> + Send + Sync + 'static>),
@@ -184,6 +184,7 @@ where
         &mut self,
         actor_ref: WeakActorRef<Self>,
         id: ActorId,
+        _outcome: ActorTerminalOutcome,
         _reason: ActorStopReason,
     ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
         let Some(actor_ref) = actor_ref.upgrade() else {

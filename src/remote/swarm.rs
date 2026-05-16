@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     Actor,
-    actor::{ActorId, ActorRef, RemoteActorRef},
+    actor::{ActorId, ActorRef, ActorTerminalOutcome, RemoteActorRef},
     error::{ActorStopReason, Infallible, RegistryError, RemoteSendError},
 };
 
@@ -249,6 +249,7 @@ impl ActorSwarm {
         notified_actor_id: ActorId,
         notified_actor_remote_id: Cow<'static, str>,
         stop_reason: ActorStopReason,
+        outcome: ActorTerminalOutcome,
     ) -> impl Future<Output = Result<(), RemoteSendError<Infallible>>> {
         let reply_rx = self
             .swarm_tx
@@ -257,6 +258,7 @@ impl ActorSwarm {
                 notified_actor_id,
                 notified_actor_remote_id,
                 stop_reason,
+                outcome,
                 reply,
             });
 
@@ -500,6 +502,8 @@ pub(crate) enum SwarmCommand {
         notified_actor_remote_id: Cow<'static, str>,
         /// The reason the actor died.
         stop_reason: ActorStopReason,
+        /// The terminal outcome published by the actor that died.
+        outcome: ActorTerminalOutcome,
         /// Reply sender.
         reply: oneshot::Sender<SwarmResponse>,
     },
