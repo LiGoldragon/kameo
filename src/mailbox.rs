@@ -827,6 +827,9 @@ enum MailboxReceiverInner<A: Actor> {
 
 impl<A: Actor> MailboxReceiver<A> {
     fn record_received_signal(&self, signal: &Signal<A>) {
+        #[cfg(not(feature = "metrics"))]
+        let _ = signal;
+
         #[cfg(feature = "metrics")]
         match signal {
             Signal::Message { .. } => self.messages_received.increment(1),
@@ -1373,16 +1376,14 @@ where
     fn closed(&self) -> BoxFuture<'_, ()> {
         match &self.inner {
             WeakMailboxSenderInner::Bounded { messages, .. } => async move {
-                match messages.upgrade() {
-                    Some(tx) => tx.closed().await,
-                    None => {}
+                if let Some(tx) = messages.upgrade() {
+                    tx.closed().await;
                 }
             }
             .boxed(),
             WeakMailboxSenderInner::Unbounded { messages, .. } => async move {
-                match messages.upgrade() {
-                    Some(tx) => tx.closed().await,
-                    None => {}
+                if let Some(tx) = messages.upgrade() {
+                    tx.closed().await;
                 }
             }
             .boxed(),

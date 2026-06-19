@@ -1253,11 +1253,12 @@ mod tests {
         }
 
         let actor_ref = MyActor::spawn_with_mailbox(MyActor, mailbox::bounded(1));
-        // Mailbox is empty, this will make there be one item in the mailbox
+        actor_ref.wait_for_startup().await;
+        // We need enough messages to both occupy the actor and fill the bounded channel.
         #[cfg(not(feature = "hotpath"))]
-        let fill_count = 1;
+        let fill_count = 2;
         #[cfg(feature = "hotpath")]
-        let fill_count = 4; // Sadly, hotpath adds some proxy layers, causing the fill count to be 4 instead of 1
+        let fill_count = 4;
         for _ in 0..fill_count {
             assert_eq!(
                 actor_ref
@@ -1267,6 +1268,7 @@ mod tests {
                     .await,
                 Ok(())
             );
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(
